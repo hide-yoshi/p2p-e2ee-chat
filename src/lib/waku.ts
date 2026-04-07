@@ -6,25 +6,30 @@ import type { WireMessage, PreKeyBundle } from '../types';
 const APP_NAME = 'p2p-e2ee-chat';
 const APP_VERSION = '1';
 
-function chatTopic(conversationId: string): string {
-  return `/${APP_NAME}/${APP_VERSION}/chat-${conversationId}/proto`;
-}
+// Single content topic for all messages to ensure reliable Filter delivery.
+// Multiple content topics can land on different shards/relay nodes, causing
+// messages to silently disappear. A single topic guarantees that if Filter
+// works at all, ALL message types are delivered.
+const GLOBAL_TOPIC = `/${APP_NAME}/${APP_VERSION}/global/proto`;
 
-function keysTopic(address: string): string {
-  return `/${APP_NAME}/${APP_VERSION}/keys-${address.toLowerCase()}/proto`;
-}
-
-function inboxTopic(address: string): string {
-  return `/${APP_NAME}/${APP_VERSION}/inbox-${address.toLowerCase()}/proto`;
+// Envelope wrapping all messages on the global topic
+interface Envelope {
+  type: 'prekey' | 'inbox' | 'chat';
+  to: string; // recipient address (lowercased) or conversation id
+  payload: unknown;
 }
 
 export type MessageHandler = (msg: WireMessage) => void;
 
 export class WakuTransport {
   private node: LightNode | null = null;
-  private codecs = new Map<string, { encoder: IEncoder; decoder: IDecoder<IDecodedMessage> }>();
+  private encoder: IEncoder | null = null;
+  private decoder: IDecoder<IDecodedMessage> | null = null;
   private readyPromise: Promise<void>;
   private _ready = false;
+
+  // Handlers keyed by "type:target"
+  private handlers = new Map<string, Set<(data: unknown) => void>>();
 
   constructor() {
     this.readyPromise = this.init();
@@ -36,18 +41,35 @@ export class WakuTransport {
       this.node = await createLightNode({ defaultBootstrap: true });
       await this.node.start();
       console.log('[waku] node started, waiting for remote peers...');
-      // Wait for at least Filter + LightPush; Store is best-effort
       await this.node.waitForPeers(
         [Protocols.Filter, Protocols.LightPush],
         60_000
       );
-      // Try to wait for Store separately, but don't fail if unavailable
       try {
         await this.node.waitForPeers([Protocols.Store], 10_000);
         console.log('[waku] store peer available');
       } catch {
         console.log('[waku] no store peer available (store queries will be skipped)');
       }
+
+      this.encoder = this.node.createEncoder({ contentTopic: GLOBAL_TOPIC });
+      this.decoder = this.node.createDecoder({ contentTopic: GLOBAL_TOPIC });
+
+      // Single global filter subscription
+      await this.node.filter.subscribe([this.decoder], (wakuMsg) => {
+        if (!wakuMsg.payload) return;
+        try {
+          const envelope: Envelope = JSON.parse(new TextDecoder().decode(wakuMsg.payload));
+          const key = `${envelope.type}:${envelope.to.toLowerCase()}`;
+          console.log('[waku] filter received envelope', envelope.type, 'to', envelope.to);
+          const set = this.handlers.get(key);
+          if (set) {
+            for (const h of set) h(envelope.payload);
+          }
+        } catch {}
+      });
+      console.log('[waku] subscribed to global topic');
+
       this._ready = true;
       console.log('[waku] connected to remote peers');
     } catch (err) {
@@ -63,63 +85,42 @@ export class WakuTransport {
     return this._ready;
   }
 
-  private getOrCreateCodecs(topic: string): { encoder: IEncoder; decoder: IDecoder<IDecodedMessage> } {
-    let c = this.codecs.get(topic);
-    if (c) return c;
-    if (!this.node) throw new Error('Node not initialized');
-    const encoder = this.node.createEncoder({ contentTopic: topic });
-    const decoder = this.node.createDecoder({ contentTopic: topic });
-    c = { encoder, decoder };
-    this.codecs.set(topic, c);
-    return c;
+  private addHandler(type: string, target: string, handler: (data: unknown) => void): void {
+    const key = `${type}:${target.toLowerCase()}`;
+    let set = this.handlers.get(key);
+    if (!set) {
+      set = new Set();
+      this.handlers.set(key, set);
+    }
+    set.add(handler);
   }
 
-  // --- Publish / Subscribe ---
-
-  async publish(topic: string, data: unknown): Promise<void> {
-    if (!this.node?.lightPush) return;
+  private async publish(envelope: Envelope): Promise<void> {
+    if (!this.node?.lightPush || !this.encoder) return;
     await this.readyPromise;
-    const { encoder } = this.getOrCreateCodecs(topic);
-    const payload = new TextEncoder().encode(JSON.stringify(data));
+    const payload = new TextEncoder().encode(JSON.stringify(envelope));
     try {
-      await this.node.lightPush.send(encoder, { payload });
+      await this.node.lightPush.send(this.encoder, { payload });
     } catch (err) {
       console.error('[waku] publish failed:', err);
     }
   }
 
-  async subscribe(topic: string, handler: (data: unknown) => void): Promise<void> {
-    if (!this.node?.filter) return;
+  private async queryHistory<T = unknown>(type: string, target: string): Promise<T[]> {
+    if (!this.node?.store || !this.decoder) return [];
     await this.readyPromise;
-    const { decoder } = this.getOrCreateCodecs(topic);
-    try {
-      await this.node.filter.subscribe([decoder], (wakuMsg) => {
-        console.log('[waku] filter received message on topic', topic);
-        if (!wakuMsg.payload) return;
-        try {
-          const data = JSON.parse(new TextDecoder().decode(wakuMsg.payload));
-          handler(data);
-        } catch {}
-      });
-      console.log('[waku] subscribed to', topic);
-    } catch (err) {
-      console.error('[waku] subscribe failed:', err);
-    }
-  }
-
-  async queryHistory<T = unknown>(topic: string): Promise<T[]> {
-    if (!this.node?.store) return [];
-    await this.readyPromise;
-    const { decoder } = this.getOrCreateCodecs(topic);
     const results: T[] = [];
+    const targetLower = target.toLowerCase();
     try {
-      for await (const page of this.node.store.queryGenerator([decoder])) {
+      for await (const page of this.node.store.queryGenerator([this.decoder])) {
         for (const promiseOrMsg of page) {
           const wakuMsg = await promiseOrMsg;
           if (!wakuMsg?.payload) continue;
           try {
-            const data = JSON.parse(new TextDecoder().decode(wakuMsg.payload));
-            results.push(data as T);
+            const envelope: Envelope = JSON.parse(new TextDecoder().decode(wakuMsg.payload));
+            if (envelope.type === type && envelope.to.toLowerCase() === targetLower) {
+              results.push(envelope.payload as T);
+            }
           } catch {}
         }
       }
@@ -132,21 +133,18 @@ export class WakuTransport {
   // --- High-level API ---
 
   async publishPreKeyBundle(bundle: PreKeyBundle): Promise<void> {
-    const topic = keysTopic(bundle.address);
-    await this.publish(topic, bundle);
+    await this.publish({ type: 'prekey', to: bundle.address, payload: bundle });
     console.log('[waku] published pre-key bundle for', bundle.address);
   }
 
   async fetchPreKeyBundle(address: string, timeoutMs = 90000): Promise<PreKeyBundle | null> {
-    const topic = keysTopic(address);
-
     // Try store first
-    const bundles = await this.queryHistory<PreKeyBundle>(topic);
+    const bundles = await this.queryHistory<PreKeyBundle>('prekey', address);
     if (bundles.length > 0) {
       return bundles.sort((a, b) => b.timestamp - a.timestamp)[0];
     }
 
-    // Store unavailable or empty: subscribe and wait for the bundle via Filter
+    // Wait for bundle via Filter
     console.log('[waku] pre-key bundle not in store, subscribing and waiting...');
     return new Promise<PreKeyBundle | null>((resolve) => {
       let resolved = false;
@@ -158,49 +156,64 @@ export class WakuTransport {
         }
       }, timeoutMs);
 
-      this.subscribe(topic, (data) => {
+      this.addHandler('prekey', address, (data) => {
         console.log('[waku] fetchPreKeyBundle received data via filter:', !!data);
         if (!resolved) {
           resolved = true;
           clearTimeout(timer);
           resolve(data as PreKeyBundle);
         }
-      }).then(() => {
-        console.log('[waku] fetchPreKeyBundle filter subscription ready');
       });
     });
   }
 
   async sendMessage(conversationId: string, msg: WireMessage): Promise<void> {
-    const topic = chatTopic(conversationId);
-    console.log('[waku] sendMessage to topic', topic, 'kind:', msg.kind);
-    await this.publish(topic, msg);
+    console.log('[waku] sendMessage to conv', conversationId, 'kind:', msg.kind);
+    await this.publish({ type: 'chat', to: conversationId, payload: msg });
   }
 
   async sendToInbox(address: string, msg: WireMessage): Promise<void> {
-    const topic = inboxTopic(address);
-    console.log('[waku] sendToInbox', address, 'topic', topic, 'kind:', msg.kind);
-    await this.publish(topic, msg);
+    console.log('[waku] sendToInbox', address, 'kind:', msg.kind);
+    await this.publish({ type: 'inbox', to: address, payload: msg });
   }
 
   async subscribeToChat(conversationId: string, handler: MessageHandler): Promise<void> {
-    const topic = chatTopic(conversationId);
-    await this.subscribe(topic, (data) => handler(data as WireMessage));
+    this.addHandler('chat', conversationId, (data) => handler(data as WireMessage));
+    console.log('[waku] registered chat handler for', conversationId);
   }
 
   async subscribeToInbox(address: string, handler: MessageHandler): Promise<void> {
-    const topic = inboxTopic(address);
-    await this.subscribe(topic, (data) => handler(data as WireMessage));
+    this.addHandler('inbox', address, (data) => handler(data as WireMessage));
+    console.log('[waku] registered inbox handler for', address);
   }
 
   async fetchChatHistory(conversationId: string): Promise<WireMessage[]> {
-    const topic = chatTopic(conversationId);
-    return this.queryHistory<WireMessage>(topic);
+    return this.queryHistory<WireMessage>('chat', conversationId);
   }
 
   async fetchInbox(address: string): Promise<WireMessage[]> {
-    const topic = inboxTopic(address);
-    return this.queryHistory<WireMessage>(topic);
+    return this.queryHistory<WireMessage>('inbox', address);
+  }
+
+  async resubscribe(): Promise<void> {
+    if (!this.node?.filter || !this.decoder) return;
+    try {
+      await this.node.filter.subscribe([this.decoder], (wakuMsg) => {
+        if (!wakuMsg.payload) return;
+        try {
+          const envelope: Envelope = JSON.parse(new TextDecoder().decode(wakuMsg.payload));
+          const key = `${envelope.type}:${envelope.to.toLowerCase()}`;
+          console.log('[waku] filter received envelope', envelope.type, 'to', envelope.to);
+          const set = this.handlers.get(key);
+          if (set) {
+            for (const h of set) h(envelope.payload);
+          }
+        } catch {}
+      });
+      console.log('[waku] re-subscribed to global topic');
+    } catch (err) {
+      console.error('[waku] re-subscribe failed:', err);
+    }
   }
 
   async destroy(): Promise<void> {

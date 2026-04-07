@@ -1,14 +1,14 @@
 @import "tailwindcss";
 
 @theme {
-  --color-bg: #05050a;
-  --color-surface: #0a0b12;
-  --color-surface-2: #0f1018;
-  --color-border: #1a1b2e;
-  --color-border-light: #252640;
-  --color-text: #c8c8d4;
-  --color-text-muted: #6a6a8a;
-  --color-text-dim: #3a3a55;
+  --color-bg: #0a0a14;
+  --color-surface: #10111c;
+  --color-surface-2: #161724;
+  --color-border: #252640;
+  --color-border-light: #33345a;
+  --color-text: #e4e4ee;
+  --color-text-muted: #9595b0;
+  --color-text-dim: #5c5c7a;
   --color-neon-cyan: #00f0ff;
   --color-neon-magenta: #ff00aa;
   --color-neon-green: #39ff14;
@@ -55,8 +55,8 @@ body::after {
     0deg,
     transparent,
     transparent 2px,
-    rgba(0, 240, 255, 0.015) 2px,
-    rgba(0, 240, 255, 0.015) 4px
+    rgba(0, 240, 255, 0.008) 2px,
+    rgba(0, 240, 255, 0.008) 4px
   );
 }
 

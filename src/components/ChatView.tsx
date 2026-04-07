@@ -39,7 +39,7 @@ export function ChatView({ messages, currentAddress, peerAddress, onSendMessage 
           <span className="text-neon-cyan/40 text-xs">@</span>
           <h2 className="text-sm text-neon-cyan glow-cyan font-mono">{shortenAddress(peerAddress)}</h2>
         </div>
-        <div className="text-[9px] text-text-dim uppercase tracking-wider">
+        <div className="text-[9px] text-text-muted uppercase tracking-wider">
           x3dh + aes-256-gcm
         </div>
       </div>
@@ -49,7 +49,7 @@ export function ChatView({ messages, currentAddress, peerAddress, onSendMessage 
         <div className="space-y-3">
           {messages.length === 0 && (
             <div className="text-center py-12">
-              <div className="text-[10px] text-text-dim uppercase tracking-wider">
+              <div className="text-[10px] text-text-muted uppercase tracking-wider">
                 // e2ee channel initialized — no messages yet
               </div>
             </div>
@@ -59,15 +59,15 @@ export function ChatView({ messages, currentAddress, peerAddress, onSendMessage 
             return (
               <div key={msg.id} className="group">
                 <div className="flex items-baseline gap-2">
-                  <span className="text-[10px] text-text-dim font-mono w-16 shrink-0">
+                  <span className="text-[10px] text-text-muted font-mono w-16 shrink-0">
                     {formatTime(msg.timestamp)}
                   </span>
                   <span className={`text-[11px] font-mono shrink-0 ${
-                    isMine ? 'text-neon-magenta/70' : 'text-neon-green/70'
+                    isMine ? 'text-neon-magenta' : 'text-neon-green'
                   }`}>
                     {isMine ? 'you' : shortenAddress(msg.senderAddress)}
                   </span>
-                  <span className="text-text-dim text-xs">:</span>
+                  <span className="text-text-muted text-xs">:</span>
                   <span className="text-sm text-text break-words">{msg.content}</span>
                 </div>
               </div>
@@ -87,7 +87,7 @@ export function ChatView({ messages, currentAddress, peerAddress, onSendMessage 
             onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && handleSend()}
             placeholder="type message..."
             className="flex-1 bg-transparent text-sm text-text py-1
-                       focus:outline-none placeholder:text-text-dim caret-neon-cyan"
+                       focus:outline-none placeholder:text-text-muted caret-neon-cyan"
           />
           <button
             onClick={handleSend}

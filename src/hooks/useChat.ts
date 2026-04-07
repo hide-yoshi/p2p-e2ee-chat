@@ -39,6 +39,10 @@ export function useChat(identity: Identity) {
   const keyBundleRef = useRef<KeyBundle | null>(null);
   const currentContactRef = useRef<string | null>(null);
   const seenMessages = useRef(new Set<string>());
+  // Pending x3dh-init messages to re-send until the peer acknowledges
+  const pendingX3dhInits = useRef<Map<string, WireMessage>>(new Map());
+  // Pending outgoing messages to re-send (keyed by messageId → {to, msg})
+  const pendingOutgoing = useRef<Map<string, { to: string; msg: WireMessage }>>(new Map());
 
   useEffect(() => {
     currentContactRef.current = currentContact;
@@ -97,56 +101,65 @@ export function useChat(identity: Identity) {
   );
 
   async function handleX3DHInit(msg: WireMessage) {
+    console.log('[x3dh] handleX3DHInit called, hasKeyBundle:', !!keyBundleRef.current, 'hasEphemeralKey:', !!msg.ephemeralKey);
     if (!keyBundleRef.current || !msg.ephemeralKey) return;
 
-    const kb = keyBundleRef.current;
-    const aliceEphemeralPublic = await importPublicKey(msg.ephemeralKey);
-    const aliceIdentityPublic = await importPublicKey(
-      JSON.parse(msg.payload) // payload contains alice's identity public key for x3dh-init
-    );
+    try {
+      const kb = keyBundleRef.current;
+      const aliceEphemeralPublic = await importPublicKey(msg.ephemeralKey);
+      const aliceIdentityPublic = await importPublicKey(
+        JSON.parse(msg.payload) // payload contains alice's identity public key for x3dh-init
+      );
 
-    let opkPrivate: CryptoKey | undefined;
-    if (msg.usedOneTimeKeyIndex !== undefined && kb.oneTimePreKeyPairs[msg.usedOneTimeKeyIndex]) {
-      opkPrivate = kb.oneTimePreKeyPairs[msg.usedOneTimeKeyIndex].privateKey;
-    }
-
-    const sharedKey = await x3dhRespond(
-      kb.identityKeyPair.privateKey,
-      kb.signedPreKeyPair.privateKey,
-      aliceIdentityPublic,
-      aliceEphemeralPublic,
-      opkPrivate
-    );
-
-    const sharedKeyStr = await exportKey(sharedKey);
-    const identityKeyJwk = await exportPublicKey(aliceIdentityPublic);
-
-    const contact: Contact = {
-      address: msg.senderAddress,
-      identityKey: identityKeyJwk,
-      sharedKey: sharedKeyStr,
-      addedAt: Date.now(),
-    };
-
-    await db.contacts.put(contact);
-    setContacts((prev) => {
-      const exists = prev.findIndex((c) => c.address === msg.senderAddress);
-      if (exists >= 0) {
-        const updated = [...prev];
-        updated[exists] = contact;
-        return updated;
+      let opkPrivate: CryptoKey | undefined;
+      if (msg.usedOneTimeKeyIndex !== undefined && kb.oneTimePreKeyPairs[msg.usedOneTimeKeyIndex]) {
+        opkPrivate = kb.oneTimePreKeyPairs[msg.usedOneTimeKeyIndex].privateKey;
       }
-      return [...prev, contact];
-    });
 
-    // Now decrypt the actual message content if present
+      const sharedKey = await x3dhRespond(
+        kb.identityKeyPair.privateKey,
+        kb.signedPreKeyPair.privateKey,
+        aliceIdentityPublic,
+        aliceEphemeralPublic,
+        opkPrivate
+      );
 
-    // Subscribe to conversation
-    const convId = getConversationId(identity.address, msg.senderAddress);
-    wakuRef.current?.subscribeToChat(convId, handleMessage);
+      const sharedKeyStr = await exportKey(sharedKey);
+      const identityKeyJwk = await exportPublicKey(aliceIdentityPublic);
+
+      const contact: Contact = {
+        address: msg.senderAddress,
+        identityKey: identityKeyJwk,
+        sharedKey: sharedKeyStr,
+        addedAt: Date.now(),
+      };
+
+      await db.contacts.put(contact);
+      setContacts((prev) => {
+        const exists = prev.findIndex((c) => c.address === msg.senderAddress);
+        if (exists >= 0) {
+          const updated = [...prev];
+          updated[exists] = contact;
+          return updated;
+        }
+        return [...prev, contact];
+      });
+      console.log('[x3dh] contact saved:', msg.senderAddress);
+    } catch (err) {
+      console.error('[x3dh] handleX3DHInit failed:', err);
+    }
   }
 
   async function handleChatMessage(msg: WireMessage) {
+    // Peer sent us a chat message, so they have our shared key - stop resending x3dh-init
+    pendingX3dhInits.current.delete(msg.senderAddress.toLowerCase());
+    // Clear pending outgoing messages to this peer (they're online and connected)
+    for (const [id, entry] of pendingOutgoing.current) {
+      if (entry.to.toLowerCase() === msg.senderAddress.toLowerCase()) {
+        pendingOutgoing.current.delete(id);
+      }
+    }
+
     const contact = await db.contacts.get(msg.senderAddress);
     if (!contact) {
       console.log('[chat] no contact found for', msg.senderAddress);
@@ -242,23 +255,40 @@ export function useChat(identity: Identity) {
         await handleMessage(msg);
       }
 
-      // Subscribe to existing contact conversations
-      const savedContacts = await db.contacts.toArray();
-      for (const contact of savedContacts) {
-        const convId = getConversationId(identity.address, contact.address);
-        await waku.subscribeToChat(convId, handleMessage);
-
-        // Fetch missed chat messages
-        const history = await waku.fetchChatHistory(convId);
-        for (const msg of history) {
-          await handleMessage(msg);
+      // Periodically re-subscribe and re-send pending x3dh-init messages
+      const resubInterval = setInterval(async () => {
+        if (cancelled) return;
+        try {
+          await waku.resubscribe();
+        } catch (err) {
+          console.error('[waku] re-subscribe error:', err);
         }
-      }
+      }, 30_000);
+
+      // Re-send pending messages every 5 seconds until delivered
+      const resendInterval = setInterval(async () => {
+        if (cancelled) return;
+        for (const [addr, msg] of pendingX3dhInits.current) {
+          console.log('[waku] re-sending x3dh-init to', addr);
+          await waku.sendToInbox(addr, msg);
+        }
+        for (const [id, { to, msg }] of pendingOutgoing.current) {
+          console.log('[waku] re-sending chat msg', id.slice(0, 8), 'to', to.slice(0, 10));
+          await waku.sendToInbox(to, msg);
+        }
+      }, 5_000);
+
+      cleanupTimers = () => {
+        clearInterval(resubInterval);
+        clearInterval(resendInterval);
+      };
     }
 
+    let cleanupTimers: (() => void) | undefined;
     setup();
     return () => {
       cancelled = true;
+      cleanupTimers?.();
       wakuRef.current?.destroy();
     };
   }, [identity, handleMessage]);
@@ -325,8 +355,8 @@ export function useChat(identity: Identity) {
       };
       await waku.sendToInbox(peerAddress, initMsg);
 
-      // Subscribe to conversation
-      await waku.subscribeToChat(convId, handleMessage);
+      // Store for periodic re-sending until peer processes it
+      pendingX3dhInits.current.set(peerAddress.toLowerCase(), initMsg);
 
       return true;
     },
@@ -360,7 +390,9 @@ export function useChat(identity: Identity) {
       };
 
       seenMessages.current.add(messageId);
-      await waku.sendMessage(convId, wireMsg);
+      // Send to recipient's inbox and queue for re-sending
+      await waku.sendToInbox(currentContact, wireMsg);
+      pendingOutgoing.current.set(messageId, { to: currentContact, msg: wireMsg });
 
       const chatMsg: ChatMessage = {
         id: messageId,

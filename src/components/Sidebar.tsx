@@ -64,7 +64,7 @@ export function Sidebar({
           <button
             onClick={onAddContact}
             disabled={!wakuReady || addingContact || !newAddress.trim()}
-            className="text-[9px] text-neon-cyan/50 hover:text-neon-cyan
+            className="text-[9px] text-neon-cyan/70 hover:text-neon-cyan
                        disabled:opacity-30 transition-colors px-1"
           >
             {addingContact ? '...' : '[add]'}

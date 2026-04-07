@@ -65,7 +65,7 @@ function ChatApp({ identity }: { identity: Identity }) {
           <div className="flex-1 flex items-center justify-center">
             <div className="text-center space-y-2">
               <p className="text-sm text-text-muted">no conversation selected</p>
-              <p className="text-xs text-text-dim">add a contact by wallet address to start chatting</p>
+              <p className="text-xs text-text-muted/70">add a contact by wallet address to start chatting</p>
             </div>
           </div>
         )}
